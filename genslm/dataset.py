@@ -609,3 +609,191 @@ class SequenceDataset(Dataset):  # type: ignore[type-arg]
             "attention_mask": batch_encoding["attention_mask"],
         }
         return sample
+
+
+class ClassificationDataset(SequenceDataset):
+    """Dataset for genomic sequence classification tasks."""
+    
+    def __init__(
+        self,
+        sequences: List[str],
+        labels: List[int],
+        seq_length: int,
+        tokenizer: PreTrainedTokenizerFast,
+        kmer_size: int = 3,
+        verbose: bool = True,
+    ):
+        """
+        Initialize classification dataset.
+        
+        Parameters
+        ----------
+        sequences : List[str]
+            List of genomic sequences
+        labels : List[int]
+            List of integer labels corresponding to each sequence
+        seq_length : int
+            Maximum sequence length for padding/truncation
+        tokenizer : PreTrainedTokenizerFast
+            Tokenizer for sequence encoding
+        kmer_size : int
+            K-mer size for sequence tokenization
+        verbose : bool
+            Whether to show progress bars
+        """
+        if len(sequences) != len(labels):
+            raise ValueError("Number of sequences must match number of labels")
+        
+        super().__init__(sequences, seq_length, tokenizer, kmer_size, verbose)
+        self.labels = torch.tensor(labels, dtype=torch.long)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get item with labels included."""
+        sample = super().__getitem__(idx)
+        sample["labels"] = self.labels[idx]
+        return sample
+    
+    @classmethod
+    def from_csv(
+        cls,
+        csv_path: PathLike,
+        sequence_col: str,
+        label_col: str,
+        seq_length: int,
+        tokenizer: PreTrainedTokenizerFast,
+        kmer_size: int = 3,
+        verbose: bool = True,
+        train_split: float = 0.7,
+        val_split: float = 0.15,
+        test_split: float = 0.15,
+        random_seed: int = 42
+    ) -> Dict[str, "ClassificationDataset"]:
+        """
+        Create train/val/test datasets from CSV file.
+        
+        Parameters
+        ----------
+        csv_path : PathLike
+            Path to CSV file containing sequences and labels
+        sequence_col : str
+            Column name containing genomic sequences
+        label_col : str
+            Column name containing labels
+        seq_length : int
+            Maximum sequence length for padding/truncation
+        tokenizer : PreTrainedTokenizerFast
+            Tokenizer for sequence encoding
+        kmer_size : int
+            K-mer size for sequence tokenization
+        verbose : bool
+            Whether to show progress bars
+        train_split : float
+            Fraction of data for training
+        val_split : float
+            Fraction of data for validation
+        test_split : float
+            Fraction of data for testing
+        random_seed : int
+            Random seed for reproducible splits
+            
+        Returns
+        -------
+        Dict[str, ClassificationDataset]
+            Dictionary with 'train', 'val', and 'test' datasets
+        """
+        import pandas as pd
+        from sklearn.preprocessing import LabelEncoder
+        from sklearn.model_selection import train_test_split
+        
+        # Validate splits
+        if abs(train_split + val_split + test_split - 1.0) > 1e-6:
+            raise ValueError("Train, validation, and test splits must sum to 1.0")
+        
+        # Load data
+        df = pd.read_csv(csv_path)
+        
+        if sequence_col not in df.columns:
+            raise ValueError(f"Sequence column '{sequence_col}' not found in CSV")
+        if label_col not in df.columns:
+            raise ValueError(f"Label column '{label_col}' not found in CSV")
+        
+        # Remove rows with missing data
+        initial_len = len(df)
+        df = df.dropna(subset=[sequence_col, label_col])
+        if len(df) < initial_len:
+            warnings.warn(f"Removed {initial_len - len(df)} rows with missing data")
+        
+        sequences = df[sequence_col].tolist()
+        labels_raw = df[label_col].tolist()
+        
+        # Encode labels to integers
+        label_encoder = LabelEncoder()
+        labels = label_encoder.fit_transform(labels_raw)
+        
+        if verbose:
+            print(f"Loaded {len(sequences)} samples")
+            print(f"Number of classes: {len(label_encoder.classes_)}")
+            print(f"Class distribution: {dict(zip(*np.unique(labels, return_counts=True)))}")
+        
+        # Create splits
+        np.random.seed(random_seed)
+        
+        # First split: train vs (val + test)
+        try:
+            X_train, X_temp, y_train, y_temp = train_test_split(
+                sequences, labels,
+                test_size=(val_split + test_split),
+                random_state=random_seed,
+                stratify=labels
+            )
+        except ValueError as e:
+            # If stratification fails (e.g., too few samples per class), use random split
+            warnings.warn(f"Stratification failed, using random split: {e}")
+            X_train, X_temp, y_train, y_temp = train_test_split(
+                sequences, labels,
+                test_size=(val_split + test_split),
+                random_state=random_seed
+            )
+        
+        # Second split: val vs test
+        val_ratio = val_split / (val_split + test_split)
+        try:
+            X_val, X_test, y_val, y_test = train_test_split(
+                X_temp, y_temp,
+                test_size=(1 - val_ratio),
+                random_state=random_seed,
+                stratify=y_temp
+            )
+        except ValueError as e:
+            # If stratification fails, use random split
+            warnings.warn(f"Stratification failed for val/test split, using random split: {e}")
+            X_val, X_test, y_val, y_test = train_test_split(
+                X_temp, y_temp,
+                test_size=(1 - val_ratio),
+                random_state=random_seed
+            )
+        
+        # Create datasets
+        datasets = {}
+        for split_name, (seqs, labs) in [
+            ("train", (X_train, y_train)),
+            ("val", (X_val, y_val)),
+            ("test", (X_test, y_test))
+        ]:
+            datasets[split_name] = cls(
+                sequences=seqs,
+                labels=labs.tolist(),
+                seq_length=seq_length,
+                tokenizer=tokenizer,
+                kmer_size=kmer_size,
+                verbose=verbose
+            )
+            
+            if verbose:
+                print(f"{split_name.capitalize()} set: {len(seqs)} samples")
+        
+        # Store label encoder for later use
+        for dataset in datasets.values():
+            dataset.label_encoder = label_encoder
+            
+        return datasets
